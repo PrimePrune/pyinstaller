@@ -1,0 +1,39 @@
+name: Build Windows EXE (PyInstaller)
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build EXE
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onefile `
+            --name ImageProcessor `
+            --collect-all PySide6 `
+            --collect-all cv2 `
+            gui.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImageProcessor-windows
+          path: dist/ImageProcessor.exe
