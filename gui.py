@@ -1,10 +1,12 @@
 """
-PySide6 + OpenCV IR(그레이스케일) 영상처리 GUI 템플릿
-- 파일 열기(이미지/영상)
-- 3가지 처리(Denoise / CLAHE / Sharpen) On/Off + 강도 조절
-- 원본/처리 결과 탭 프리뷰
-- 이미지 저장, 영상 Export(현재 설정으로 전체 저장)
-- 영상 재생은 QThread로 UI 프리징 방지
+PySide6 + OpenCV IR 영상처리 GUI (요구사항 반영 최종)
+- 입력: mp4/avi 등 일반 영상 포맷(이미지도 지원)
+- 화면: 좌측 원본 / 우측 처리 결과
+- 영상: Preview(1-Frame)로 1프레임 처리 미리보기 + Play로 실시간 처리
+- 이미지: Preview(1-Frame)로 처리 결과 갱신
+- 처리: Bilateral Denoise + CLAHE + Unsharp Sharpen
+- Normalize 옵션 제거 (입력이 이미 8-bit 영상인 전제)
+- 툴팁 문장/말투/형식 통일
 
 설치:
   pip install pyside6 opencv-python numpy
@@ -19,16 +21,15 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap, QAction
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -38,8 +39,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QSplitter,
     QStatusBar,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
     QProgressBar,
@@ -47,19 +48,18 @@ from PySide6.QtWidgets import (
 
 
 # -----------------------------
-# Utils: ndarray -> QImage
+# Utils
 # -----------------------------
 def to_qimage_gray8(gray8: np.ndarray) -> QImage:
     """gray8: HxW uint8"""
     if gray8.dtype != np.uint8:
         gray8 = gray8.astype(np.uint8, copy=False)
     h, w = gray8.shape[:2]
-    # bytesPerLine = w
     return QImage(gray8.data, w, h, w, QImage.Format_Grayscale8).copy()
 
 
 def ensure_gray(frame: np.ndarray) -> np.ndarray:
-    """Force grayscale."""
+    """입력이 컬러로 들어와도 그레이로 변환합니다."""
     if frame is None:
         return frame
     if frame.ndim == 2:
@@ -71,132 +71,94 @@ def ensure_gray(frame: np.ndarray) -> np.ndarray:
     return frame
 
 
-def normalize_to_u8(gray: np.ndarray, mode: str = "minmax", p_lo: float = 1.0, p_hi: float = 99.0) -> np.ndarray:
+def as_u8_for_display(gray: np.ndarray) -> np.ndarray:
     """
-    Display normalization for preview.
-    - mode="minmax": min~max
-    - mode="percentile": p_lo~p_hi
-    Returns uint8.
+    일반 mp4/avi 입력(대개 uint8)을 전제로 표시용 변환만 합니다.
+    - uint8이면 그대로 사용
+    - 그 외 타입이면 안전하게 clip 후 uint8로 변환
     """
-    g = gray.astype(np.float32, copy=False)
-
-    if mode == "percentile":
-        lo = np.percentile(g, p_lo)
-        hi = np.percentile(g, p_hi)
-    else:
-        lo = float(np.min(g))
-        hi = float(np.max(g))
-
-    if hi <= lo + 1e-6:
-        return np.zeros_like(gray, dtype=np.uint8)
-
-    x = (g - lo) * (255.0 / (hi - lo))
-    x = np.clip(x, 0, 255).astype(np.uint8)
+    if gray is None:
+        return gray
+    if gray.dtype == np.uint8:
+        return gray
+    x = np.clip(gray, 0, 255).astype(np.uint8)
     return x
 
 
 # -----------------------------
-# Processing params + pipeline
+# Processing
 # -----------------------------
 @dataclass
 class ProcParams:
-    # Denoise
+    # Bilateral Denoise
     denoise_on: bool = True
-    denoise_mode: str = "Bilateral"  # Bilateral | NLMeans | Temporal(EMA)
-    denoise_strength: int = 20       # 0~100 (mapped)
+    denoise_strength: int = 20  # 0~100 -> sigma 5~75
 
     # CLAHE
     clahe_on: bool = True
-    clahe_clip: int = 20            # 1~100 -> 0.5~6.0
-    clahe_tile: int = 8             # 4~16
+    clahe_clip: int = 20        # 1~100 -> 0.5~6.0
+    clahe_tile: int = 8         # 4~16
 
-    # Sharpen
+    # Sharpen (Unsharp)
     sharp_on: bool = True
-    sharp_amount: int = 30          # 0~100 -> 0~2.0
-    sharp_sigma: int = 10           # 1~30 -> 0.5~3.0
-
-    # Preview normalization (IR often benefits)
-    preview_norm: str = "percentile"  # minmax | percentile
+    sharp_amount: int = 30      # 0~100 -> 0~2.0
+    sharp_sigma: int = 10       # 1~30 -> 0.5~3.0
 
 
 class Processor:
-    """
-    Stateless-ish processor. For Temporal(EMA), you can feed prev state.
-    """
-    def __init__(self):
-        self._ema_prev: Optional[np.ndarray] = None
+    """상태 없는(Stateless) 처리 파이프라인입니다."""
 
-    def reset_state(self):
-        self._ema_prev = None
-
-    def apply(self, gray: np.ndarray, p: ProcParams) -> np.ndarray:
+    def apply(self, gray_u8: np.ndarray, p: ProcParams) -> np.ndarray:
         """
-        gray: uint8/uint16/float. returns same dtype-ish (we keep float32 internally).
+        입력/출력: uint8 그레이 이미지
         """
-        if gray is None:
-            return gray
+        if gray_u8 is None:
+            return gray_u8
 
-        x = gray.astype(np.float32, copy=False)
+        # 내부 계산은 float32로 하고 마지막에 uint8로 돌아옵니다.
+        x = gray_u8.astype(np.float32, copy=False)
 
-        # 1) Denoise
+        # 1) Bilateral Denoise
         if p.denoise_on:
-            if p.denoise_mode == "Bilateral":
-                # Map strength 0~100 -> sigmaColor 5~75, sigmaSpace 5~75
-                s = float(np.interp(p.denoise_strength, [0, 100], [5, 75]))
-                # bilateralFilter expects uint8/float, ok on float32
-                x = cv2.bilateralFilter(x, d=0, sigmaColor=s, sigmaSpace=s)
-            elif p.denoise_mode == "NLMeans":
-                # NLMeans expects uint8; use preview-normalized uint8 then re-scale back (simple version)
-                u8 = normalize_to_u8(x, mode="percentile")
-                h = float(np.interp(p.denoise_strength, [0, 100], [3, 30]))
-                u8 = cv2.fastNlMeansDenoising(u8, None, h=h, templateWindowSize=7, searchWindowSize=21)
-                x = u8.astype(np.float32)
-            elif p.denoise_mode == "Temporal(EMA)":
-                # alpha: 0.05~0.6
-                alpha = float(np.interp(p.denoise_strength, [0, 100], [0.05, 0.6]))
-                if self._ema_prev is None:
-                    self._ema_prev = x.copy()
-                else:
-                    self._ema_prev = alpha * x + (1.0 - alpha) * self._ema_prev
-                x = self._ema_prev
+            sigma = float(np.interp(p.denoise_strength, [0, 100], [5, 75]))
+            # d=0이면 sigma 기반으로 자동 결정
+            x = cv2.bilateralFilter(x, d=0, sigmaColor=sigma, sigmaSpace=sigma)
 
-        # 2) CLAHE
+        # 2) CLAHE (uint8 기반이 가장 안정적)
         if p.clahe_on:
-            # CLAHE expects uint8. We'll map via display normalization then apply CLAHE.
-            u8 = normalize_to_u8(x, mode="percentile")
+            tmp_u8 = np.clip(x, 0, 255).astype(np.uint8)
             clip = float(np.interp(p.clahe_clip, [1, 100], [0.5, 6.0]))
             tile = int(np.clip(p.clahe_tile, 4, 16))
             clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
-            u8 = clahe.apply(u8)
-            x = u8.astype(np.float32)
+            tmp_u8 = clahe.apply(tmp_u8)
+            x = tmp_u8.astype(np.float32)
 
-        # 3) Sharpen (Unsharp mask)
+        # 3) Sharpen (Unsharp)
         if p.sharp_on:
             amount = float(np.interp(p.sharp_amount, [0, 100], [0.0, 2.0]))
             sigma = float(np.interp(p.sharp_sigma, [1, 30], [0.5, 3.0]))
             blur = cv2.GaussianBlur(x, (0, 0), sigmaX=sigma, sigmaY=sigma)
             x = cv2.addWeighted(x, 1.0 + amount, blur, -amount, 0)
 
-        # keep as float32; caller will normalize for preview / convert for saving
-        return x
+        return np.clip(x, 0, 255).astype(np.uint8)
 
 
 # -----------------------------
-# Video Player Worker (QThread)
+# Video Worker
 # -----------------------------
 class VideoWorker(QThread):
-    frame_ready = Signal(np.ndarray, np.ndarray, float)  # (orig_gray, proc_float, proc_ms)
-    meta_ready = Signal(float, int, int)                 # (fps, w, h)
+    frame_ready = Signal(np.ndarray, np.ndarray, float)  # orig_u8, proc_u8, proc_ms
+    meta_ready = Signal(float, int, int)                 # fps, w, h
     finished = Signal(str)
 
-    def __init__(self, path: str, processor: Processor, params_getter):
+    def __init__(self, path: str, params_getter):
         super().__init__()
         self.path = path
-        self.processor = processor
         self.params_getter = params_getter
 
         self._stop = False
         self._pause = False
+        self.processor = Processor()
 
     def stop(self):
         self._stop = True
@@ -218,7 +180,6 @@ class VideoWorker(QThread):
         self.meta_ready.emit(float(fps), w, h)
 
         frame_period = 1.0 / float(fps)
-        self.processor.reset_state()
 
         while not self._stop:
             if self._pause:
@@ -230,16 +191,16 @@ class VideoWorker(QThread):
                 break
 
             gray = ensure_gray(frame)
+            orig_u8 = as_u8_for_display(gray)
 
             t0 = time.perf_counter()
             params = self.params_getter()
-            proc = self.processor.apply(gray, params)
+            proc_u8 = self.processor.apply(orig_u8, params)
             dt_ms = (time.perf_counter() - t0) * 1000.0
 
-            self.frame_ready.emit(gray, proc, dt_ms)
+            self.frame_ready.emit(orig_u8, proc_u8, dt_ms)
 
-            # crude timing
-            sleep_ms = max(0, int((frame_period * 1000) - 1))
+            sleep_ms = max(0, int(frame_period * 1000) - 1)
             self.msleep(sleep_ms)
 
         cap.release()
@@ -250,16 +211,16 @@ class VideoWorker(QThread):
 # Video Export Worker
 # -----------------------------
 class ExportWorker(QThread):
-    progress = Signal(int)         # 0~100
-    done = Signal(bool, str)       # success, message
+    progress = Signal(int)
+    done = Signal(bool, str)
 
-    def __init__(self, in_path: str, out_path: str, processor: Processor, params: ProcParams):
+    def __init__(self, in_path: str, out_path: str, params: ProcParams):
         super().__init__()
         self.in_path = in_path
         self.out_path = out_path
-        self.processor = processor
         self.params = params
         self._stop = False
+        self.processor = Processor()
 
     def stop(self):
         self._stop = True
@@ -277,48 +238,38 @@ class ExportWorker(QThread):
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
-        # Output codec: mp4v (works widely). If .avi -> XVID might be better.
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(self.out_path, fourcc, float(fps), (w, h), isColor=False)
         if not writer.isOpened():
             cap.release()
-            self.done.emit(False, "출력 VideoWriter를 열 수 없습니다. (코덱/경로 확인)")
+            self.done.emit(False, "출력 VideoWriter를 열 수 없습니다. 코덱 또는 경로를 확인해 주세요.")
             return
 
-        self.processor.reset_state()
         idx = 0
-
         while not self._stop:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
-            gray = ensure_gray(frame)
 
-            proc = self.processor.apply(gray, self.params)
-            # Export는 8-bit로 저장(간단 버전). 필요하면 16-bit/RAW 저장은 별도 설계.
-            out_u8 = normalize_to_u8(proc, mode="percentile")
+            gray = ensure_gray(frame)
+            orig_u8 = as_u8_for_display(gray)
+            out_u8 = self.processor.apply(orig_u8, self.params)
             writer.write(out_u8)
 
             idx += 1
             if total > 0:
-                pct = int((idx / total) * 100)
-                self.progress.emit(min(100, max(0, pct)))
-            else:
-                # unknown total
-                if idx % 30 == 0:
-                    self.progress.emit(min(99, idx % 100))
-
-            if self._stop:
-                break
+                self.progress.emit(min(100, int((idx / total) * 100)))
+            elif idx % 30 == 0:
+                self.progress.emit(min(99, idx % 100))
 
         cap.release()
         writer.release()
 
         if self._stop:
-            self.done.emit(False, "사용자에 의해 중단됨")
+            self.done.emit(False, "사용자에 의해 중단되었습니다.")
         else:
             self.progress.emit(100)
-            self.done.emit(True, "저장 완료")
+            self.done.emit(True, "저장이 완료되었습니다.")
 
 
 # -----------------------------
@@ -330,61 +281,49 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("IR Processing GUI (PySide6)")
 
         self.params = ProcParams()
-        self.processor = Processor()
-
         self.current_path: Optional[str] = None
         self.is_video: bool = False
 
         self.video_worker: Optional[VideoWorker] = None
         self.export_worker: Optional[ExportWorker] = None
 
-        self.orig_gray: Optional[np.ndarray] = None
-        self.proc_float: Optional[np.ndarray] = None
+        self.orig_u8: Optional[np.ndarray] = None
+        self.proc_u8: Optional[np.ndarray] = None
 
         self._build_ui()
         self._bind_actions()
-
-        # 디바운스(슬라이더 드래그 중 과도한 처리 방지)
-        self.apply_timer = QTimer(self)
-        self.apply_timer.setSingleShot(True)
-        self.apply_timer.timeout.connect(self.apply_once)
+        self._apply_tooltips()
 
     # ---------- UI ----------
     def _build_ui(self):
-        # Toolbar actions
         self.act_open = QAction("Open", self)
-        self.act_save = QAction("Save As...", self)
-        self.act_export = QAction("Export Video...", self)
+        self.act_save_img = QAction("Save Image As...", self)
+        self.act_export_vid = QAction("Export Video...", self)
         self.act_play = QAction("Play", self)
         self.act_pause = QAction("Pause", self)
         self.act_stop = QAction("Stop", self)
 
         tb = self.addToolBar("Main")
         tb.addAction(self.act_open)
-        tb.addAction(self.act_save)
+        tb.addAction(self.act_save_img)
+        tb.addAction(self.act_export_vid)
         tb.addSeparator()
         tb.addAction(self.act_play)
         tb.addAction(self.act_pause)
         tb.addAction(self.act_stop)
-        tb.addSeparator()
-        tb.addAction(self.act_export)
 
-        # Left panel: controls
+        # Controls (left)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
         left_layout.setSpacing(10)
 
-        # Denoise group
-        self.grp_denoise = QGroupBox("1) Denoise")
+        # Denoise (Bilateral only)
+        self.grp_denoise = QGroupBox("1) Denoise (Bilateral)")
         gl = QVBoxLayout(self.grp_denoise)
 
         self.chk_denoise = QCheckBox("Enable")
         self.chk_denoise.setChecked(self.params.denoise_on)
-
-        self.cmb_denoise = QComboBox()
-        self.cmb_denoise.addItems(["Bilateral", "NLMeans", "Temporal(EMA)"])
-        self.cmb_denoise.setCurrentText(self.params.denoise_mode)
 
         den_row = QHBoxLayout()
         den_row.addWidget(QLabel("Strength"))
@@ -398,11 +337,9 @@ class MainWindow(QMainWindow):
         den_row.addWidget(self.spn_denoise)
 
         gl.addWidget(self.chk_denoise)
-        gl.addWidget(QLabel("Mode"))
-        gl.addWidget(self.cmb_denoise)
         gl.addLayout(den_row)
 
-        # CLAHE group
+        # CLAHE
         self.grp_clahe = QGroupBox("2) Contrast (CLAHE)")
         cl = QVBoxLayout(self.grp_clahe)
 
@@ -435,7 +372,7 @@ class MainWindow(QMainWindow):
         cl.addLayout(row1)
         cl.addLayout(row2)
 
-        # Sharpen group
+        # Sharpen
         self.grp_sharp = QGroupBox("3) Sharpen (Unsharp)")
         sl = QVBoxLayout(self.grp_sharp)
 
@@ -468,64 +405,38 @@ class MainWindow(QMainWindow):
         sl.addLayout(row3)
         sl.addLayout(row4)
 
-        # Preview norm
-        self.grp_prev = QGroupBox("Preview")
-        pl = QVBoxLayout(self.grp_prev)
-        self.cmb_norm = QComboBox()
-        self.cmb_norm.addItems(["percentile", "minmax"])
-        self.cmb_norm.setCurrentText(self.params.preview_norm)
-        pl.addWidget(QLabel("Normalize (for display/export-u8)"))
-        pl.addWidget(self.cmb_norm)
-
-        # Buttons
-        self.btn_apply = QPushButton("Apply (Image only)")
-        self.btn_apply.setEnabled(False)
+        # Preview button
+        self.btn_preview = QPushButton("Preview (1-Frame)")
+        self.btn_preview.setEnabled(False)
 
         left_layout.addWidget(self.grp_denoise)
         left_layout.addWidget(self.grp_clahe)
         left_layout.addWidget(self.grp_sharp)
-        left_layout.addWidget(self.grp_prev)
-        left_layout.addWidget(self.btn_apply)
+        left_layout.addWidget(self.btn_preview)
         left_layout.addStretch(1)
 
-        # Right panel: previews
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(8, 8, 8, 8)
-
-        self.tabs = QTabWidget()
-        self.lbl_proc = QLabel("Open an image/video…")
-        self.lbl_orig = QLabel("")
-
-        for lbl in (self.lbl_proc, self.lbl_orig):
+        # Side-by-side previews
+        self.lbl_orig = QLabel("Left: Original")
+        self.lbl_proc = QLabel("Right: Processed")
+        for lbl in (self.lbl_orig, self.lbl_proc):
             lbl.setAlignment(Qt.AlignCenter)
-            lbl.setMinimumSize(640, 360)
+            lbl.setMinimumSize(480, 360)
             lbl.setStyleSheet("QLabel { background: #111; color: #ddd; }")
-            lbl.setScaledContents(False)
 
-        proc_page = QWidget()
-        proc_l = QVBoxLayout(proc_page)
-        proc_l.addWidget(self.lbl_proc)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._wrap_panel("Original", self.lbl_orig))
+        splitter.addWidget(self._wrap_panel("Processed", self.lbl_proc))
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
 
-        orig_page = QWidget()
-        orig_l = QVBoxLayout(orig_page)
-        orig_l.addWidget(self.lbl_orig)
-
-        self.tabs.addTab(proc_page, "Processed")
-        self.tabs.addTab(orig_page, "Original")
-
-        right_layout.addWidget(self.tabs)
-
-        # Main layout
         central = QWidget()
         main = QHBoxLayout(central)
         main.setContentsMargins(6, 6, 6, 6)
         main.setSpacing(10)
         main.addWidget(left, 0)
-        main.addWidget(right, 1)
+        main.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
-        # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
@@ -534,16 +445,26 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.status.addPermanentWidget(self.progress)
 
+    def _wrap_panel(self, title: str, content: QLabel) -> QWidget:
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(6, 6, 6, 6)
+        t = QLabel(title)
+        t.setAlignment(Qt.AlignCenter)
+        t.setStyleSheet("QLabel { color: #bbb; }")
+        l.addWidget(t)
+        l.addWidget(content, 1)
+        return w
+
     def _bind_actions(self):
         self.act_open.triggered.connect(self.open_file)
-        self.act_save.triggered.connect(self.save_as)
-        self.act_export.triggered.connect(self.export_video)
-
+        self.act_save_img.triggered.connect(self.save_image_as)
+        self.act_export_vid.triggered.connect(self.export_video)
         self.act_play.triggered.connect(self.play_video)
         self.act_pause.triggered.connect(self.pause_video)
         self.act_stop.triggered.connect(self.stop_video)
 
-        # control bindings (slider <-> spin)
+        # slider <-> spin
         def bind_slider_spin(slider: QSlider, spin: QSpinBox):
             slider.valueChanged.connect(spin.setValue)
             spin.valueChanged.connect(slider.setValue)
@@ -554,31 +475,66 @@ class MainWindow(QMainWindow):
         bind_slider_spin(self.sld_amount, self.spn_amount)
         bind_slider_spin(self.sld_sigma, self.spn_sigma)
 
-        # any param change -> schedule apply (image) or just affect video worker processing
-        def schedule():
+        # 파라미터 변경 시: 내부 파라미터만 갱신합니다.
+        def on_param_changed():
             self._pull_params_from_ui()
-            if not self.is_video:
-                self.apply_timer.start(80)  # debounce
 
         for w in [
-            self.chk_denoise, self.cmb_denoise, self.sld_denoise,
+            self.chk_denoise, self.sld_denoise,
             self.chk_clahe, self.sld_clip, self.sld_tile,
             self.chk_sharp, self.sld_amount, self.sld_sigma,
-            self.cmb_norm
         ]:
             if isinstance(w, QCheckBox):
-                w.stateChanged.connect(schedule)
-            elif isinstance(w, QComboBox):
-                w.currentTextChanged.connect(schedule)
+                w.stateChanged.connect(on_param_changed)
             else:
-                w.valueChanged.connect(schedule)
+                w.valueChanged.connect(on_param_changed)
 
-        self.btn_apply.clicked.connect(self.apply_once)
+        self.btn_preview.clicked.connect(self.preview_one_frame)
+
+    def _apply_tooltips(self):
+        # Tooltip 스타일 통일: "~합니다/~해 주세요" 형태로 맞춤
+        self.btn_preview.setToolTip(
+            "현재 프레임 1장에 파라미터를 적용하여 우측 결과를 갱신합니다.\n"
+            "Play를 누르기 전에 결과를 빠르게 확인할 때 사용해 주세요."
+        )
+
+        self.grp_denoise.setToolTip("Bilateral 필터로 노이즈를 완화합니다. 경계는 비교적 보존됩니다.")
+        self.chk_denoise.setToolTip("노이즈 제거 기능을 켜거나 끕니다.")
+        self.sld_denoise.setToolTip(
+            "노이즈 제거 강도를 조절합니다.\n"
+            "값이 클수록 더 부드러워지지만 세부 디테일이 줄어들 수 있습니다."
+        )
+        self.spn_denoise.setToolTip(self.sld_denoise.toolTip())
+
+        self.grp_clahe.setToolTip("CLAHE로 국부 대비를 향상하여 디테일을 강조합니다.")
+        self.chk_clahe.setToolTip("대비 향상 기능을 켜거나 끕니다.")
+        self.sld_clip.setToolTip(
+            "clipLimit을 조절합니다.\n"
+            "값이 클수록 대비가 증가하지만 노이즈가 함께 강조될 수 있습니다."
+        )
+        self.spn_clip.setToolTip(self.sld_clip.toolTip())
+        self.sld_tile.setToolTip(
+            "tileGridSize(블록 크기)를 조절합니다.\n"
+            "값이 작을수록 더 국부적으로 동작하지만 인공적인 패턴이 생길 수 있습니다."
+        )
+        self.spn_tile.setToolTip(self.sld_tile.toolTip())
+
+        self.grp_sharp.setToolTip("Unsharp Mask로 선명도를 강화합니다. 노이즈도 함께 커질 수 있습니다.")
+        self.chk_sharp.setToolTip("샤프닝 기능을 켜거나 끕니다.")
+        self.sld_amount.setToolTip(
+            "샤프닝 강도를 조절합니다.\n"
+            "값이 클수록 경계가 더 강조됩니다."
+        )
+        self.spn_amount.setToolTip(self.sld_amount.toolTip())
+        self.sld_sigma.setToolTip(
+            "블러 반경(sigma)을 조절합니다.\n"
+            "값이 작으면 미세한 경계를, 값이 크면 큰 구조를 더 강조합니다."
+        )
+        self.spn_sigma.setToolTip(self.sld_sigma.toolTip())
 
     # ---------- Params ----------
     def _pull_params_from_ui(self):
         self.params.denoise_on = self.chk_denoise.isChecked()
-        self.params.denoise_mode = self.cmb_denoise.currentText()
         self.params.denoise_strength = int(self.sld_denoise.value())
 
         self.params.clahe_on = self.chk_clahe.isChecked()
@@ -589,19 +545,16 @@ class MainWindow(QMainWindow):
         self.params.sharp_amount = int(self.sld_amount.value())
         self.params.sharp_sigma = int(self.sld_sigma.value())
 
-        self.params.preview_norm = self.cmb_norm.currentText()
-
     def _get_params_snapshot(self) -> ProcParams:
-        # dataclass copy (cheap)
         return ProcParams(**self.params.__dict__)
 
-    # ---------- File open ----------
+    # ---------- Open ----------
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open image/video",
             "",
-            "Media (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.mp4 *.avi *.mkv *.mov);;All files (*.*)",
+            "Media (*.mp4 *.avi *.mkv *.mov *.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All files (*.*)",
         )
         if not path:
             return
@@ -610,15 +563,17 @@ class MainWindow(QMainWindow):
         self.current_path = path
         self.is_video = self._is_video_file(path)
 
-        self.status.showMessage(f"Opened: {os.path.basename(path)}")
+        self.orig_u8 = None
+        self.proc_u8 = None
+        self.lbl_proc.setText("Right: Processed")
+        self.btn_preview.setEnabled(True)
 
         if self.is_video:
-            self.btn_apply.setEnabled(False)
-            self.start_video_worker(path)
+            self.load_video_first_frame(path)
+            self.status.showMessage(f"Video loaded: {os.path.basename(path)} (Preview 또는 Play를 눌러 주세요.)")
         else:
-            self.btn_apply.setEnabled(True)
             self.load_image(path)
-            self.apply_once()
+            self.status.showMessage(f"Image loaded: {os.path.basename(path)} (Preview를 눌러 주세요.)")
 
     def _is_video_file(self, path: str) -> bool:
         ext = os.path.splitext(path)[1].lower()
@@ -629,89 +584,61 @@ class MainWindow(QMainWindow):
         if img is None:
             QMessageBox.critical(self, "Error", "이미지를 읽을 수 없습니다.")
             return
-
         gray = ensure_gray(img)
-        self.orig_gray = gray
-        self.processor.reset_state()
+        self.orig_u8 = as_u8_for_display(gray)
+        self._update_orig(self.orig_u8)
 
-        self._update_preview_labels(gray, None, proc_ms=None)
-
-    # ---------- Apply (image) ----------
-    def apply_once(self):
-        if self.is_video:
+    def load_video_first_frame(self, path: str):
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            QMessageBox.critical(self, "Error", "영상을 열 수 없습니다.")
             return
-        if self.orig_gray is None:
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            QMessageBox.critical(self, "Error", "첫 프레임을 읽을 수 없습니다.")
+            return
+        gray = ensure_gray(frame)
+        self.orig_u8 = as_u8_for_display(gray)
+        self._update_orig(self.orig_u8)
+
+    # ---------- Preview ----------
+    def preview_one_frame(self):
+        if self.orig_u8 is None:
             return
 
         self._pull_params_from_ui()
 
+        proc = Processor()
         t0 = time.perf_counter()
-        proc = self.processor.apply(self.orig_gray, self.params)
+        out_u8 = proc.apply(self.orig_u8, self.params)
         dt_ms = (time.perf_counter() - t0) * 1000.0
 
-        self.proc_float = proc
-        self._update_preview_labels(self.orig_gray, proc, proc_ms=dt_ms)
-
-    # ---------- Preview update ----------
-    def _fit_pixmap(self, label: QLabel, pix: QPixmap) -> QPixmap:
-        if pix.isNull():
-            return pix
-        w = max(1, label.width() - 4)
-        h = max(1, label.height() - 4)
-        return pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-    def _update_preview_labels(self, orig_gray: Optional[np.ndarray], proc_float: Optional[np.ndarray], proc_ms: Optional[float]):
-        if orig_gray is not None:
-            u8o = normalize_to_u8(orig_gray, mode=self.params.preview_norm)
-            qio = to_qimage_gray8(u8o)
-            pixo = QPixmap.fromImage(qio)
-            self.lbl_orig.setPixmap(self._fit_pixmap(self.lbl_orig, pixo))
-
-        if proc_float is not None:
-            u8p = normalize_to_u8(proc_float, mode=self.params.preview_norm)
-            qip = to_qimage_gray8(u8p)
-            pixp = QPixmap.fromImage(qip)
-            self.lbl_proc.setPixmap(self._fit_pixmap(self.lbl_proc, pixp))
-
-        if proc_ms is not None:
-            self.status.showMessage(f"Proc: {proc_ms:.2f} ms   |   {os.path.basename(self.current_path or '')}")
-
-    def resizeEvent(self, event):
-        # refit current pixmaps on resize
-        super().resizeEvent(event)
-        if self.orig_gray is not None:
-            u8o = normalize_to_u8(self.orig_gray, mode=self.params.preview_norm)
-            self.lbl_orig.setPixmap(self._fit_pixmap(self.lbl_orig, QPixmap.fromImage(to_qimage_gray8(u8o))))
-        if self.proc_float is not None:
-            u8p = normalize_to_u8(self.proc_float, mode=self.params.preview_norm)
-            self.lbl_proc.setPixmap(self._fit_pixmap(self.lbl_proc, QPixmap.fromImage(to_qimage_gray8(u8p))))
+        self.proc_u8 = out_u8
+        self._update_proc(out_u8)
+        self.status.showMessage(f"Preview (1-frame): {dt_ms:.2f} ms   |   {os.path.basename(self.current_path or '')}")
 
     # ---------- Video controls ----------
-    def start_video_worker(self, path: str):
-        self.video_worker = VideoWorker(path, self.processor, self._get_params_snapshot)
+    def play_video(self):
+        if not self.is_video or not self.current_path:
+            return
+
+        if self.video_worker is not None and self.video_worker.isRunning():
+            self.video_worker.set_pause(False)
+            return
+
+        self._pull_params_from_ui()
+        self.video_worker = VideoWorker(self.current_path, self._get_params_snapshot)
         self.video_worker.meta_ready.connect(self._on_video_meta)
         self.video_worker.frame_ready.connect(self._on_video_frame)
         self.video_worker.finished.connect(self._on_video_finished)
         self.video_worker.start()
-
-    def _on_video_meta(self, fps: float, w: int, h: int):
-        self.status.showMessage(f"Video: {os.path.basename(self.current_path or '')}  |  {w}x{h} @ {fps:.2f}fps")
-
-    def _on_video_frame(self, orig_gray: np.ndarray, proc_float: np.ndarray, proc_ms: float):
-        self.orig_gray = orig_gray
-        self.proc_float = proc_float
-        self._update_preview_labels(orig_gray, proc_float, proc_ms=proc_ms)
-
-    def _on_video_finished(self, msg: str):
-        self.status.showMessage(msg)
-
-    def play_video(self):
-        if self.video_worker is not None and self.video_worker.isRunning():
-            self.video_worker.set_pause(False)
+        self.status.showMessage("Playing...")
 
     def pause_video(self):
         if self.video_worker is not None and self.video_worker.isRunning():
             self.video_worker.set_pause(True)
+            self.status.showMessage("Paused")
 
     def stop_video(self):
         if self.video_worker is not None and self.video_worker.isRunning():
@@ -719,32 +646,66 @@ class MainWindow(QMainWindow):
             self.video_worker.wait(800)
         self.video_worker = None
 
-    # ---------- Save ----------
-    def save_as(self):
-        if self.proc_float is None:
-            QMessageBox.information(self, "Info", "저장할 결과가 없습니다.")
+    def _on_video_meta(self, fps: float, w: int, h: int):
+        self.status.showMessage(f"Video: {os.path.basename(self.current_path or '')}  |  {w}x{h} @ {fps:.2f}fps")
+
+    def _on_video_frame(self, orig_u8: np.ndarray, proc_u8: np.ndarray, proc_ms: float):
+        self.orig_u8 = orig_u8
+        self.proc_u8 = proc_u8
+        self._update_orig(orig_u8)
+        self._update_proc(proc_u8)
+        self.status.showMessage(f"Proc: {proc_ms:.2f} ms   |   {os.path.basename(self.current_path or '')}")
+
+    def _on_video_finished(self, msg: str):
+        self.status.showMessage(msg)
+
+    # ---------- Preview update ----------
+    def _fit_pixmap(self, label: QLabel, pix: QPixmap) -> QPixmap:
+        if pix.isNull():
+            return pix
+        w = max(1, label.width() - 6)
+        h = max(1, label.height() - 6)
+        return pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _update_orig(self, orig_u8: np.ndarray):
+        pix = QPixmap.fromImage(to_qimage_gray8(orig_u8))
+        self.lbl_orig.setPixmap(self._fit_pixmap(self.lbl_orig, pix))
+
+    def _update_proc(self, proc_u8: np.ndarray):
+        pix = QPixmap.fromImage(to_qimage_gray8(proc_u8))
+        self.lbl_proc.setPixmap(self._fit_pixmap(self.lbl_proc, pix))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.orig_u8 is not None:
+            self._update_orig(self.orig_u8)
+        if self.proc_u8 is not None:
+            self._update_proc(self.proc_u8)
+
+    # ---------- Save / Export ----------
+    def save_image_as(self):
+        if self.proc_u8 is None:
+            QMessageBox.information(self, "Info", "저장할 처리 결과가 없습니다. Preview 후 저장해 주세요.")
             return
 
-        # default extension: png
         out_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save output image",
+            "Save processed image",
             "",
             "PNG (*.png);;JPG (*.jpg *.jpeg);;TIFF (*.tif *.tiff);;All files (*.*)",
         )
         if not out_path:
             return
 
-        out_u8 = normalize_to_u8(self.proc_float, mode=self.params.preview_norm)
-        ok = cv2.imwrite(out_path, out_u8)
+        ok = cv2.imwrite(out_path, self.proc_u8)
         if ok:
             self.status.showMessage(f"Saved: {out_path}")
         else:
-            QMessageBox.critical(self, "Error", "저장 실패")
+            QMessageBox.critical(self, "Error", "저장에 실패했습니다.")
 
     def export_video(self):
         if not self.is_video or not self.current_path:
-            QMessageBox.information(self, "Info", "영상 파일을 먼저 열어주세요.")
+            QMessageBox.information(self, "Info", "영상 파일을 먼저 열어 주세요.")
             return
         if self.export_worker is not None and self.export_worker.isRunning():
             QMessageBox.information(self, "Info", "이미 Export 중입니다.")
@@ -759,16 +720,13 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
-        # Export 동안 재생을 멈추는 게 안정적(간단/실전)
-        self.pause_video()
-
         self._pull_params_from_ui()
         params_snapshot = self._get_params_snapshot()
 
         self.progress.setVisible(True)
         self.progress.setValue(0)
 
-        self.export_worker = ExportWorker(self.current_path, out_path, Processor(), params_snapshot)
+        self.export_worker = ExportWorker(self.current_path, out_path, params_snapshot)
         self.export_worker.progress.connect(self.progress.setValue)
         self.export_worker.done.connect(self._on_export_done)
         self.export_worker.start()
@@ -793,10 +751,11 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     w = MainWindow()
-    w.resize(1100, 650)
+    w.resize(1250, 700)
     w.show()
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     main()
+
