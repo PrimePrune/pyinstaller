@@ -6,7 +6,7 @@ import time
 import tempfile
 import shutil
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import cv2
 import numpy as np
@@ -40,6 +40,15 @@ def to_qimage_gray8(gray8: np.ndarray) -> QImage:
         gray8 = gray8.astype(np.uint8, copy=False)
     h, w = gray8.shape[:2]
     return QImage(gray8.data, w, h, w, QImage.Format_Grayscale8).copy()
+
+
+def to_qimage_bgr(bgr: np.ndarray) -> QImage:
+    # bgr: HxWx3 uint8
+    if bgr.dtype != np.uint8:
+        bgr = bgr.astype(np.uint8, copy=False)
+    h, w = bgr.shape[:2]
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
 
 def ensure_gray(frame: np.ndarray) -> np.ndarray:
@@ -134,6 +143,110 @@ class Processor:
             x = cv2.addWeighted(x, 1.0 + amount, blur, -amount, 0)
 
         return np.clip(x, 0, 255).astype(np.uint8)
+
+
+class ONNXDetector:
+    """Lightweight ONNX detector wrapper using OpenCV DNN for YOLOv8-style ONNX exports.
+
+    It expects the ONNX to produce outputs compatible with common YOLOv8 exports
+    (rows of [x,y,w,h,conf,class_scores...]) after the network forward.
+    """
+
+    def __init__(self, model_path: str, img_size: int = 640, conf_thresh: float = 0.25, iou_thresh: float = 0.45):
+        self.net = cv2.dnn.readNet(model_path)
+        self.img_size = int(img_size)
+        self.conf_thresh = float(conf_thresh)
+        self.iou_thresh = float(iou_thresh)
+
+    def detect(self, img_bgr: np.ndarray) -> List[Dict]:
+        h0, w0 = img_bgr.shape[:2]
+        blob = cv2.dnn.blobFromImage(img_bgr, 1.0 / 255.0, (self.img_size, self.img_size), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.net.getUnconnectedOutLayersNames())
+
+        # normalize outputs to shape (N, dims) with rows representing detections
+        preds: List[np.ndarray] = []
+        outs_list = outs if isinstance(outs, (list, tuple)) else [outs]
+        for o in outs_list:
+            if o is None:
+                continue
+            arr = np.array(o)
+            # arr may be (1,5,8400) or (1,8400,5) or (1,N,85) etc
+            if arr.ndim == 3:
+                # if second dim is 5 (common for best.onnx) then transpose to bring feature dim last
+                if arr.shape[1] == 5 and arr.shape[2] != 5:
+                    arr = arr.transpose(0, 2, 1)
+                arr = arr.reshape(-1, arr.shape[-1])
+            elif arr.ndim == 2:
+                arr = arr.reshape(-1, arr.shape[-1])
+            else:
+                continue
+            preds.append(arr)
+        pred = np.vstack(preds) if preds else np.zeros((0, 0), dtype=np.float32)
+
+        boxes = []
+        confidences = []
+        class_ids = []
+
+        # scale factors from model input size to original image
+        scale_x = w0 / float(self.img_size)
+        scale_y = h0 / float(self.img_size)
+
+        for row in pred:
+            if row.size < 5:
+                continue
+            x, y, w, h = row[0:4]
+            obj_conf = float(row[4])
+            score = obj_conf
+            cls_id = 0
+            # optional class scores
+            if row.size > 5:
+                class_scores = row[5:]
+                if class_scores.size > 0:
+                    cls_id = int(np.argmax(class_scores))
+                    cls_conf = float(class_scores[cls_id])
+                    score *= cls_conf
+            if score < self.conf_thresh:
+                continue
+
+            # coordinates are in model input pixel space
+            cx = float(x) * scale_x
+            cy = float(y) * scale_y
+            bw = float(w) * scale_x
+            bh = float(h) * scale_y
+            x1 = cx - bw / 2.0
+            y1 = cy - bh / 2.0
+
+            boxes.append([int(x1), int(y1), int(bw), int(bh)])
+            confidences.append(float(score))
+            class_ids.append(int(cls_id))
+
+        # NMS
+        indices = []
+        if boxes:
+            indices = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_thresh, self.iou_thresh)
+            if isinstance(indices, (list, tuple)):
+                indices = [i[0] if isinstance(i, (tuple, list, np.ndarray)) and len(i) else int(i) for i in indices]
+            elif isinstance(indices, np.ndarray):
+                indices = indices.flatten().tolist()
+            else:
+                try:
+                    indices = [int(indices)]
+                except Exception:
+                    indices = []
+
+        results = []
+        for i in indices:
+            if i < 0 or i >= len(boxes):
+                continue
+            x, y, bw, bh = boxes[i]
+            results.append({
+                "box": (x, y, x + bw, y + bh),
+                "score": confidences[i],
+                "class_id": class_ids[i],
+            })
+
+        return results
 
 
 # -----------------------------
@@ -396,6 +509,10 @@ class MainWindow(QMainWindow):
         self.current_path: Optional[str] = None
         self.is_video: bool = False
 
+        # ONNX detection
+        self.detector: Optional[ONNXDetector] = None
+        self.onnx_model_path: Optional[str] = None
+
         self.video_worker: Optional[VideoWorker] = None
         self.prep_worker: Optional[PreprocessWorker] = None
 
@@ -454,10 +571,23 @@ class MainWindow(QMainWindow):
         row_c = QHBoxLayout()
         row_c.addWidget(QLabel("sigmaColor"))
         self.sld_sigmac = QSlider(Qt.Horizontal)
+
+        # ONNX detection controls
+        self.chk_detect = QCheckBox("Enable ONNX Detection")
+        self.chk_detect.setChecked(False)
+        self.btn_load_onnx = QPushButton("Load ONNX Model")
+        self.lbl_onnx_path = QLabel("(no model)")
+        self.lbl_onnx_path.setStyleSheet("QLabel { color: #999; }")
+
         self.sld_sigmac.setRange(0, 60)
         self.sld_sigmac.setValue(self.params.sigma_color)
         self.spn_sigmac = QSpinBox()
         self.spn_sigmac.setRange(0, 60)
+        left_layout.addWidget(self.chk_detect)
+        h_onnx = QHBoxLayout()
+        h_onnx.addWidget(self.btn_load_onnx)
+        h_onnx.addWidget(self.lbl_onnx_path)
+        left_layout.addLayout(h_onnx)
         self.spn_sigmac.setValue(self.params.sigma_color)
         row_c.addWidget(self.sld_sigmac)
         row_c.addWidget(self.spn_sigmac)
@@ -656,6 +786,8 @@ class MainWindow(QMainWindow):
                 w.valueChanged.connect(on_param_changed)
 
         self.btn_preview.clicked.connect(self.preview_one_frame)
+        self.btn_load_onnx.clicked.connect(self.load_onnx_model)
+        self.chk_detect.stateChanged.connect(self._on_detect_toggled)
         self.btn_preprocess.clicked.connect(self.preprocess_temp_cache)
         self.btn_preprocess_cancel.clicked.connect(self.cancel_preprocess)
         self.btn_compare_play.clicked.connect(self.compare_play_non_realtime)
@@ -696,6 +828,9 @@ class MainWindow(QMainWindow):
         self.sld_amount.setToolTip("샤프닝 강도를 조절합니다. 값이 클수록 경계가 더 강조됩니다.")
         self.sld_sigma.setToolTip("블러 반경(sigma)을 조절합니다. 값이 작으면 미세 경계를 더 강조합니다.")
 
+        self.chk_detect.setToolTip("ONNX 기반 객체검출을 활성화합니다. 모델을 먼저 로드하세요.")
+        self.btn_load_onnx.setToolTip("ONNX 모델 파일(best.onnx 등)을 선택합니다.")
+
     # ---------- Params ----------
     def _pull_params_from_ui(self):
         self.params.denoise_on = self.chk_denoise.isChecked()
@@ -709,6 +844,25 @@ class MainWindow(QMainWindow):
         self.params.sharp_on = self.chk_sharp.isChecked()
         self.params.sharp_amount = int(self.sld_amount.value())
         self.params.sharp_sigma = int(self.sld_sigma.value())
+
+    def load_onnx_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load ONNX model", "", "ONNX Model (*.onnx);;All files (*.*)")
+        if not path:
+            return
+        try:
+            self.detector = ONNXDetector(path)
+            self.onnx_model_path = path
+            self.lbl_onnx_path.setText(os.path.basename(path))
+            self._set_status(f"Loaded ONNX: {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"ONNX load failed:\n{e}")
+
+    def _on_detect_toggled(self, state: int):
+        enabled = bool(state)
+        if enabled and self.detector is None:
+            QMessageBox.information(self, "Info", "ONNX 모델이 로드되어 있지 않습니다. 모델을 먼저 로드해 주세요.")
+            self.chk_detect.setChecked(False)
+            return
 
     def _get_params_snapshot(self) -> ProcParams:
         return ProcParams(**self.params.__dict__)
@@ -839,8 +993,25 @@ class MainWindow(QMainWindow):
         t0 = time.perf_counter()
         out = proc.apply(self.orig_u8, self.params)
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        self.proc_u8 = out
-        self._update_proc(out)
+        # If detection enabled and model loaded, run detection and draw on color image
+        if self.chk_detect.isChecked() and self.detector is not None:
+            bgr = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+            dets = self.detector.detect(bgr)
+            vis = bgr.copy()
+            h_img, w_img = vis.shape[:2]
+            for d in dets:
+                x1, y1, x2, y2 = d['box']
+                x1 = int(max(0, min(x1, w_img - 1)))
+                y1 = int(max(0, min(y1, h_img - 1)))
+                x2 = int(max(0, min(x2, w_img - 1)))
+                y2 = int(max(0, min(y2, h_img - 1)))
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(vis, f"{d['score']:.2f}", (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+            self.proc_u8 = vis
+            self._update_proc(vis)
+        else:
+            self.proc_u8 = out
+            self._update_proc(out)
         self._set_status(f"Preview (1-frame): {dt_ms:.2f} ms")
 
     # ---------- Realtime ----------
@@ -865,9 +1036,26 @@ class MainWindow(QMainWindow):
 
     def _on_realtime_frame(self, orig_u8: np.ndarray, proc_u8: np.ndarray, ms: float):
         self.orig_u8 = orig_u8
-        self.proc_u8 = proc_u8
         self._update_orig(orig_u8)
-        self._update_proc(proc_u8)
+
+        if self.chk_detect.isChecked() and self.detector is not None:
+            bgr = cv2.cvtColor(proc_u8, cv2.COLOR_GRAY2BGR)
+            dets = self.detector.detect(bgr)
+            vis = bgr
+            h_img, w_img = vis.shape[:2]
+            for d in dets:
+                x1, y1, x2, y2 = d['box']
+                x1 = int(max(0, min(x1, w_img - 1)))
+                y1 = int(max(0, min(y1, h_img - 1)))
+                x2 = int(max(0, min(x2, w_img - 1)))
+                y2 = int(max(0, min(y2, h_img - 1)))
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(vis, f"{d['score']:.2f}", (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+            self.proc_u8 = vis
+            self._update_proc(vis)
+        else:
+            self.proc_u8 = proc_u8
+            self._update_proc(proc_u8)
         self._set_status(f"Realtime proc: {ms:.2f} ms")
 
     # ---------- Preprocess: 항상 같은 캐시 파일에 덮어쓰기 ----------
@@ -967,9 +1155,26 @@ class MainWindow(QMainWindow):
 
     def _on_compare_frame(self, orig_u8: np.ndarray, proc_u8: np.ndarray):
         self.orig_u8 = orig_u8
-        self.proc_u8 = proc_u8
         self._update_orig(orig_u8)
-        self._update_proc(proc_u8)
+
+        if self.chk_detect.isChecked() and self.detector is not None:
+            bgr = cv2.cvtColor(proc_u8, cv2.COLOR_GRAY2BGR)
+            dets = self.detector.detect(bgr)
+            vis = bgr
+            h_img, w_img = vis.shape[:2]
+            for d in dets:
+                x1, y1, x2, y2 = d['box']
+                x1 = int(max(0, min(x1, w_img - 1)))
+                y1 = int(max(0, min(y1, h_img - 1)))
+                x2 = int(max(0, min(x2, w_img - 1)))
+                y2 = int(max(0, min(y2, h_img - 1)))
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(vis, f"{d['score']:.2f}", (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+            self.proc_u8 = vis
+            self._update_proc(vis)
+        else:
+            self.proc_u8 = proc_u8
+            self._update_proc(proc_u8)
 
     # ---------- Save cached result ----------
     def save_preprocessed_as(self):
@@ -1049,7 +1254,13 @@ class MainWindow(QMainWindow):
         self.lbl_orig.setPixmap(self._fit_pixmap(self.lbl_orig, pix))
 
     def _update_proc(self, proc_u8: np.ndarray):
-        pix = QPixmap.fromImage(to_qimage_gray8(proc_u8))
+        if proc_u8 is None:
+            return
+        if proc_u8.ndim == 2:
+            pix = QPixmap.fromImage(to_qimage_gray8(proc_u8))
+        else:
+            # assume BGR color image
+            pix = QPixmap.fromImage(to_qimage_bgr(proc_u8))
         self.lbl_proc.setPixmap(self._fit_pixmap(self.lbl_proc, pix))
 
     def resizeEvent(self, event):
